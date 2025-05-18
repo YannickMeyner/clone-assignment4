@@ -292,8 +292,95 @@ __global__ void compactPrimesNoBankConflictsKernel(int *input, int *output)
 // Wrapper-Funktion zum Starten des Kernels mit Bank-Konflikt-Vermeidung
 void compactPrimesNoBankConflictsGPU(int *d_input, int *d_output)
 {
-    // startet Kernel mit 1024 Threads (jeder Thread verarbeitet 2 Elemente)
+    // startet den Kernel mit 1024 Threads (jeder Thread verarbeitet dann genau 2 Elemente)
     compactPrimesNoBankConflictsKernel<<<1, 1024>>>(d_input, d_output);
+}
+
+
+// Prädikate und lokale Präfixsummen für jeden Block berehncnen
+__global__ void multiBlockPrimeKernel(int *inputArray, int *scannedPredicates, int *predicates, int *blockTotals)
+{
+    __shared__ int sharedPredicates[2048];
+    int threadIdx2x = threadIdx.x * 2;
+    int globalIdx = blockIdx.x * 2048 + threadIdx2x;
+    
+    // Primzahlen?
+    int prime1 = isPrimeCUDA(inputArray[globalIdx]);
+    int prime2 = isPrimeCUDA(inputArray[globalIdx + 1]);
+    
+    sharedPredicates[threadIdx2x] = prime1;
+    sharedPredicates[threadIdx2x + 1] = prime2;
+    
+    predicates[globalIdx] = prime1;
+    predicates[globalIdx + 1] = prime2;
+    
+    __syncthreads();
+    
+    // führt die exklusive Scan-Operation auf den Prädikaten dieses Blocks durch
+    exclusivePrefixScan(threadIdx.x, sharedPredicates, &blockTotals[blockIdx.x]);
+    
+    // speichert die gescannten Prädikate
+    scannedPredicates[globalIdx] = sharedPredicates[threadIdx2x];
+    scannedPredicates[globalIdx + 1] = sharedPredicates[threadIdx2x + 1];
+}
+
+// Block-Summen scannen
+__global__ void scanBlockTotals(int *blockTotals)
+{
+    __shared__ int sharedTotals[2048];
+    int idx = threadIdx.x * 2;
+    
+    // lädt die Block-Summen in den Shared Memory
+    sharedTotals[idx] = blockTotals[idx];
+    sharedTotals[idx + 1] = blockTotals[idx + 1];
+    
+    __syncthreads();
+    
+    int dummy;
+    exclusivePrefixScan(threadIdx.x, sharedTotals, &dummy);
+    
+    // speichert die gescanten Block-Summen zurück
+    blockTotals[idx] = sharedTotals[idx];
+    blockTotals[idx + 1] = sharedTotals[idx + 1];
+}
+
+// Ergebnisse kombinieren, um die endgültige Ausgabe zu erstellen
+__global__ void assembleOutput(int *inputArray, int *scannedPredicates, int *predicates, int *blockTotals, int *outputArray)
+{
+    int globalIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    // nur verarbeiten wenn das Prädikat auch wahr ist (Zahl == Primzahl)
+    if (predicates[globalIdx] == 1)
+    {
+        int outputPosition = scannedPredicates[globalIdx] + blockTotals[globalIdx / 2048];
+        outputArray[outputPosition] = inputArray[globalIdx];
+    }
+}
+
+// Wrapper-Funktion
+void compactPrimesMultiBlockGPU(int *d_input, int *d_output, int size)
+{
+    int *d_scannedPredicates, *d_predicates, *d_blockTotals;
+    gpuErrCheck(cudaMalloc(&d_scannedPredicates, size * sizeof(int)));
+    gpuErrCheck(cudaMalloc(&d_predicates, size * sizeof(int)));
+    gpuErrCheck(cudaMalloc(&d_blockTotals, 2048 * sizeof(int)));
+    
+    // Schritt 1: Prädikate und lokale Präfixsummen berehnen
+    dim3 blockSize(1024); // jeder Thread verarbeitet 2 Elemente
+    dim3 gridSize(size / 2048); // 2048 Elemente pro Block
+    multiBlockPrimeKernel<<<gridSize, blockSize>>>(d_input, d_scannedPredicates, d_predicates, d_blockTotals);
+    
+    // Schritt 2: Block-Summen scannen
+    scanBlockTotals<<<1, 1024>>>(d_blockTotals);
+    
+    // Schritt 3: endgültige Ausgabe erstellen
+    dim3 finalBlockSize(256);
+    dim3 finalGridSize(size / 256);
+    assembleOutput<<<finalGridSize, finalBlockSize>>>(d_input, d_scannedPredicates, d_predicates, d_blockTotals, d_output);
+    
+    gpuErrCheck(cudaFree(d_scannedPredicates));
+    gpuErrCheck(cudaFree(d_predicates));
+    gpuErrCheck(cudaFree(d_blockTotals));
 }
 
 int main(void)
@@ -377,7 +464,6 @@ int main(void)
     // Copy results back
     gpuErrCheck(cudaMemcpy(hostOutput_GPU, d_output, found_primes * sizeof(int), cudaMemcpyDeviceToHost));
     
-    
     // Validate results
     cout << "Validating results..." << endl;
     compareResultVec(hostOutput_CPU, hostOutput_GPU, found_primes);
@@ -385,6 +471,46 @@ int main(void)
     cout << "GPU implementation (no bank conflicts) took " << gpuTimeNoBankConflicts << " ms" << endl;
     cout << "Speedup vs CPU: " << float(cpuDuration.count()) / gpuTimeNoBankConflicts << "x" << endl;
     cout << "Improvement over basic implementation: " << gpuTime / gpuTimeNoBankConflicts << "x" << endl;
+
+    // --- Multi-Block Implementation ---
+    cout << "\nTesting multi-block implementation for all items..." << endl;
+    const int fullSize = 1 << 22;
+
+    int* fullHostVector = new int[fullSize];
+    initRandomArray(fullSize, fullHostVector);
+
+    int* fullHostOutput_CPU = new int[fullSize];
+    auto cpuFullStart = std::chrono::high_resolution_clock::now();
+    int fullFound_primes = compact_prime(fullHostVector, fullHostOutput_CPU, fullSize);
+    auto cpuFullEnd = std::chrono::high_resolution_clock::now();
+    auto cpuFullDuration = std::chrono::duration_cast<std::chrono::milliseconds>(cpuFullEnd - cpuFullStart);
+
+    cout << "Found " << fullFound_primes << " prime numbers." << endl;
+    cout << "CPU implementation took " << cpuFullDuration.count() << " ms" << endl;
+
+    int *d_fullInput, *d_fullOutput;
+    gpuErrCheck(cudaMalloc(&d_fullInput, fullSize * sizeof(int)));
+    gpuErrCheck(cudaMalloc(&d_fullOutput, fullFound_primes * sizeof(int)));
+
+    gpuErrCheck(cudaMemcpy(d_fullInput, fullHostVector, fullSize * sizeof(int), cudaMemcpyHostToDevice));
+
+    int* fullHostOutput_GPU = new int[fullFound_primes];
+
+    gpuErrCheck(cudaEventRecord(start));
+    compactPrimesMultiBlockGPU(d_fullInput, d_fullOutput, fullSize);
+    gpuErrCheck(cudaEventRecord(stop));
+    gpuErrCheck(cudaEventSynchronize(stop));
+
+    float gpuTimeMultiBlock = 0;
+    gpuErrCheck(cudaEventElapsedTime(&gpuTimeMultiBlock, start, stop));
+
+    gpuErrCheck(cudaMemcpy(fullHostOutput_GPU, d_fullOutput, fullFound_primes * sizeof(int), cudaMemcpyDeviceToHost));
+
+    // Validate results
+    cout << "Validating multi-block results..." << endl;
+    compareResultVec(fullHostOutput_CPU, fullHostOutput_GPU, fullFound_primes);
+    cout << "Multi-block GPU implementation took " << gpuTimeMultiBlock << " ms" << endl;
+    cout << "Speedup vs CPU: " << float(cpuFullDuration.count()) / gpuTimeMultiBlock << "x" << endl;
 
     // ToDo: Implement compact pattern on GPU, you can use var found_primes
 	// to allocate the right size or to only loop/check what is needed in 
@@ -394,10 +520,15 @@ int main(void)
     delete[] hostVector;
     delete[] hostOutput_CPU;
     delete[] hostOutput_GPU;
+    delete[] fullHostVector;
+    delete[] fullHostOutput_CPU;
+    delete[] fullHostOutput_GPU;
     gpuErrCheck(cudaFree(d_input));
     gpuErrCheck(cudaFree(d_output));
     gpuErrCheck(cudaEventDestroy(start));
     gpuErrCheck(cudaEventDestroy(stop));
+    gpuErrCheck(cudaFree(d_fullInput));
+    gpuErrCheck(cudaFree(d_fullOutput));
     
     return 0;
 }
