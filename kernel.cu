@@ -5,6 +5,7 @@
 #include "device_launch_parameters.h"
 
 #include <chrono>
+#include <thread>
 
 using namespace std;
 
@@ -383,6 +384,113 @@ void compactPrimesMultiBlockGPU(int *d_input, int *d_output, int size)
     gpuErrCheck(cudaFree(d_blockTotals));
 }
 
+const int TOTAL_ITERATIONS = 256;
+const int NUM_STREAMS = 8;
+const int ITERS_PER_STREAM = TOTAL_ITERATIONS / NUM_STREAMS;
+
+// Array mit zufälligen Zahlen und einem Seed-Offset initialisieren --> Seed wird für jede Iteration geädnert
+void initRandomArrayWithSeed(const int size, int *array, int seedOffset)
+{
+    srand(1337 + seedOffset);
+    for (int index = 0; index < size; ++index)
+    {
+        array[index] = rand();
+    }
+}
+
+void processStreamData(int streamIdx)
+{
+    const int dataSize = 1 << 22; // 2048 * 2048 Elemente
+    
+    // CUDA-Stream erstellen
+    cudaStream_t stream;
+    gpuErrCheck(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    
+    cudaEvent_t startEvent, endEvent, copyToGpuDone, copyFromGpuStart;
+    gpuErrCheck(cudaEventCreate(&startEvent));
+    gpuErrCheck(cudaEventCreate(&endEvent));
+    gpuErrCheck(cudaEventCreate(&copyToGpuDone));
+    gpuErrCheck(cudaEventCreate(&copyFromGpuStart));
+    
+    int *d_blockSums, *d_scannedValues, *d_predicateValues, *d_inputData, *d_outputData;
+    gpuErrCheck(cudaMallocAsync((void **)&d_blockSums, 2048 * sizeof(int), stream));
+    gpuErrCheck(cudaMallocAsync((void **)&d_scannedValues, dataSize * sizeof(int), stream));
+    gpuErrCheck(cudaMallocAsync((void **)&d_predicateValues, dataSize * sizeof(int), stream));
+    gpuErrCheck(cudaMallocAsync((void **)&d_inputData, dataSize * sizeof(int), stream));
+    gpuErrCheck(cudaMallocAsync((void **)&d_outputData, 220000 * sizeof(int), stream));
+    
+    int *hostInput = new int[dataSize];
+    int *hostOutput_CPU = new int[dataSize];
+    int *hostResult = new int[220000];
+    
+    for (int i = 0; i < ITERS_PER_STREAM; ++i)
+    {
+        // neue Daten mit unterschiedlichem Seed generieren
+        auto genStart = chrono::high_resolution_clock::now();
+        initRandomArrayWithSeed(dataSize, hostInput, (streamIdx * ITERS_PER_STREAM) + i);
+        auto genEnd = chrono::high_resolution_clock::now();
+        
+        gpuErrCheck(cudaEventRecord(startEvent, stream));
+        gpuErrCheck(cudaMemcpyAsync(d_inputData, hostInput, dataSize * sizeof(int), cudaMemcpyHostToDevice, stream));
+        gpuErrCheck(cudaEventRecord(copyToGpuDone, stream));
+        
+        // 1.: Prädikate und lokale Präfixsummen berechnen
+        dim3 blockSize(1024); //jeder Thread verarbeitet 2 Elemente
+        dim3 gridSize(dataSize / 2048); // 2048 Elemente pro Block
+        multiBlockPrimeKernel<<<gridSize, blockSize, 0, stream>>>(d_inputData, d_scannedValues, d_predicateValues, d_blockSums);
+        
+        // 2.: Block-Summen scannen
+        scanBlockTotals<<<1, 1024, 0, stream>>>(d_blockSums);
+        
+        // 3.: endgültige Ausgabe erstellen
+        dim3 finalBlockSize(256);
+        dim3 finalGridSize(dataSize / 256);
+        assembleOutput<<<finalGridSize, finalBlockSize, 0, stream>>>(d_inputData, d_scannedValues, d_predicateValues, d_blockSums, d_outputData);
+        
+        gpuErrCheck(cudaEventRecord(copyFromGpuStart, stream));
+        gpuErrCheck(cudaMemcpyAsync(hostResult, d_outputData, 220000 * sizeof(int), cudaMemcpyDeviceToHost, stream));
+        gpuErrCheck(cudaEventRecord(endEvent, stream));
+        
+        // CPU-Berechnung (parallel zur GPU-Berechnung)
+        auto cpuStart = chrono::high_resolution_clock::now();
+        int primes_found = compact_prime(hostInput, hostOutput_CPU, dataSize);
+        auto cpuEnd = chrono::high_resolution_clock::now();
+        
+        gpuErrCheck(cudaEventSynchronize(endEvent));
+        
+        auto valStart = chrono::high_resolution_clock::now();
+        compareResultVec(hostOutput_CPU, hostResult, primes_found);
+        auto valEnd = chrono::high_resolution_clock::now();
+        
+        float totalTime, copyToTime, copyFromTime;
+        gpuErrCheck(cudaEventElapsedTime(&totalTime, startEvent, endEvent));
+        gpuErrCheck(cudaEventElapsedTime(&copyToTime, startEvent, copyToGpuDone));
+        gpuErrCheck(cudaEventElapsedTime(&copyFromTime, copyFromGpuStart, endEvent));
+        
+        cout << "CPU: " << chrono::duration_cast<chrono::milliseconds>(cpuEnd - cpuStart).count() << "ms ";
+        cout << "und GPU: " << totalTime << "ms ";
+        cout << "für " << primes_found << " Primzahlen auf Stream/Iteration " << streamIdx << "/" << i << endl;
+    }
+    
+    gpuErrCheck(cudaFreeAsync(d_inputData, stream));
+    gpuErrCheck(cudaFreeAsync(d_outputData, stream));
+    gpuErrCheck(cudaFreeAsync(d_blockSums, stream));
+    gpuErrCheck(cudaFreeAsync(d_scannedValues, stream));
+    gpuErrCheck(cudaFreeAsync(d_predicateValues, stream));
+    
+    gpuErrCheck(cudaEventDestroy(startEvent));
+    gpuErrCheck(cudaEventDestroy(endEvent));
+    gpuErrCheck(cudaEventDestroy(copyToGpuDone));
+    gpuErrCheck(cudaEventDestroy(copyFromGpuStart));
+    
+    delete[] hostInput;
+    delete[] hostOutput_CPU;
+    delete[] hostResult;
+    
+    gpuErrCheck(cudaStreamSynchronize(stream));
+    gpuErrCheck(cudaStreamDestroy(stream));
+}
+
 int main(void)
 {
     // Define the size of the vector
@@ -511,6 +619,31 @@ int main(void)
     compareResultVec(fullHostOutput_CPU, fullHostOutput_GPU, fullFound_primes);
     cout << "Multi-block GPU implementation took " << gpuTimeMultiBlock << " ms" << endl;
     cout << "Speedup vs CPU: " << float(cpuFullDuration.count()) / gpuTimeMultiBlock << "x" << endl;
+
+    cout << "\nTesting parallele Stream-Implementation with " << TOTAL_ITERATIONS << " iterations..." << endl;
+
+    std::thread streamThreads[NUM_STREAMS];
+    auto totalStartTime = std::chrono::high_resolution_clock::now();
+
+    for (int i = 0; i < NUM_STREAMS; i++)
+    {
+        streamThreads[i] = std::thread(processStreamData, i);
+    }
+
+    for (int i = 0; i < NUM_STREAMS; i++)
+    {
+        streamThreads[i].join();
+    }
+
+    cudaDeviceSynchronize();
+
+    auto totalEndTime = std::chrono::high_resolution_clock::now();
+    cout << TOTAL_ITERATIONS << " Iterations completed in " 
+        << chrono::duration_cast<chrono::milliseconds>(totalEndTime - totalStartTime).count() 
+        << "ms" << endl;
+    cout << "Acverage Time per iteration: " 
+        << chrono::duration_cast<chrono::milliseconds>(totalEndTime - totalStartTime).count() / (float)TOTAL_ITERATIONS 
+        << "ms" << endl;
 
     // ToDo: Implement compact pattern on GPU, you can use var found_primes
 	// to allocate the right size or to only loop/check what is needed in 
